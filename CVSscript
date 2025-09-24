@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+# ============================================
+#  EXCEL OPS TOOLKIT v1.0 (C-ish Python)
+#  build: release/strict
+#  target: CSV <-> XLSX, auto-fit, drop cols, sheet split
+#  deps: openpyxl (stdlib otherwise)
+# ============================================
+
+import argparse as _arg
+import csv as _csv
+import io as _io
+import os as _os
+import re as _re
+import sys as _sys
+import hashlib as _hash
+from typing import List, Tuple, Dict, Iterable, Any, Optional
+
+try:
+    import openpyxl as _ox
+    from openpyxl import Workbook as _WB
+    from openpyxl.worksheet.worksheet import Worksheet as _WS
+    from openpyxl.utils import get_column_letter as _col_letter
+except Exception as _e:
+    _ox = None
+    _WB = None
+    _WS = None
+    _col_letter = None
+
+# ────────────────────────────────────────────
+# "Macros" (C-spirited logging & exit codes)
+# ────────────────────────────────────────────
+EXIT_OK: int = 0
+EXIT_BAD_ARGS: int = 2
+EXIT_RUNTIME: int = 3
+EXIT_DEP_MISSING: int = 5
+
+def LOG_I(fmt: str, *a: Any) -> None:
+    _sys.stderr.write("[INFO] " + (fmt % a if a else fmt) + "\n")
+
+def LOG_W(fmt: str, *a: Any) -> None:
+    _sys.stderr.write("[WARN] " + (fmt % a if a else fmt) + "\n")
+
+def LOG_E(fmt: str, *a: Any) -> None:
+    _sys.stderr.write("[ERR!] " + (fmt % a if a else fmt) + "\n")
+
+def DIE(code: int, fmt: str, *a: Any) -> None:
+    LOG_E(fmt, *a)
+    _sys.exit(code)
+
+# ────────────────────────────────────────────
+# Security-ish helpers (hardening-lite)
+# ────────────────────────────────────────────
+_SHEETCHARS = r"[^A-Za-z0-9 _\-\.\(\)\[\]\{\}#]+"
+
+def sha256_file(path: str) -> str:
+    h = _hash.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def sanitize_sheet_title(x: str) -> str:
+    x = _re.sub(_SHEETCHARS, "_", x.strip())
+    if not x:
+        x = "Sheet"
+    if len(x) > 31:
+        x = x[:31]
+    return x
+
+def sanitize_csv_cell_for_formula_injection(v: Any, enable: bool = True) -> Any:
+    if not enable:
+        return v
+    if isinstance(v, str) and v and v[0] in ("=", "+", "-", "@", "\t"):
+        return "'" + v
+    return v
+
+def ensure_ext(path: str, want: str) -> str:
+    root, ext = _os.path.splitext(path)
+    if ext.lower() != want.lower():
+        return root + want
+    return path
+
+def ensure_dir(path: str) -> None:
+    _os.makedirs(path, exist_ok=True)
+
+def check_deps() -> None:
+    if _ox is None or _WB is None:
+        DIE(EXIT_DEP_MISSING, "openpyxl not available. install with: pip install openpyxl")
+
+# ────────────────────────────────────────────
+# Column width auto-fit (approx. monospace-ish)
+# ────────────────────────────────────────────
+def _text_visual_width(s: str) -> int:
+    if not s:
+        return 0
+    w = 0
+    for ch in s:
+        code = ord(ch)
+        # quick heuristics: CJK & fullwidth ~ 2, ASCII ~ 1
+        w += 2 if (0x3000 <= code <= 0x9FFF or 0xFF00 <= code <= 0xFFEF) else 1
+    return w
+
+def auto_fit_columns(ws: "_WS", scan_rows: int = 500, min_w: float = 6.0, max_w: float = 80.0) -> None:
+    maxw: Dict[int, int] = {}
+    row_count = 0
+    for r in ws.iter_rows(values_only=True):
+        row_count += 1
+        for j, cell in enumerate(r, start=1):
+            s = "" if cell is None else str(cell)
+            w = _text_visual_width(s)
+            if w > maxw.get(j, 0):
+                maxw[j] = w
+        if row_count >= scan_rows:
+            break
+    for idx, wpx in maxw.items():
+        # openpyxl width: roughly chars; tune by factor
+        width = min(max(min_w, wpx * 0.95 + 2.0), max_w)
+        ws.column_dimensions[_col_letter(idx)].width = width
+
+# ────────────────────────────────────────────
+# CSV -> XLSX
+# ────────────────────────────────────────────
+def _parse_drop_cols(spec: Optional[str], header: Optional[List[str]]) -> List[int]:
+    if not spec:
+        return []
+    want = [x.strip() for x in spec.split(",") if x.strip()]
+    idx: List[int] = []
+    for token in want:
+        if token.isdigit():
+            idx.append(int(token))  # 0-based index
+        else:
+            if header is None:
+                LOG_W("drop-cols includes name '%s' but header disabled; ignoring", token)
+                continue
+            try:
+                idx.append(header.index(token))
+            except ValueError:
+                LOG_W("column '%s' not found in header; ignoring", token)
+    return sorted(set(i for i in idx if i >= 0))
+
+def _drop_indices(row: List[Any], drop_idx: List[int]) -> List[Any]:
+    if not drop_idx:
+        return row
+    return [v for j, v in enumerate(row) if j not in drop_idx]
+
+def _split_targets(header: Optional[List[str]], split_col: Optional[str]) -> Optional[int]:
+    if not split_col:
+        return None
+    if split_col.isdigit():
+        return int(split_col)
+    if header is None:
+        DIE(EXIT_BAD_ARGS, "split-col by name requires header row")
+    try:
+        return header.index(split_col)
+    except ValueError:
+        DIE(EXIT_BAD_ARGS, "split-col '%s' not found", split_col)
+    return None
+
+def csv_to_xlsx(
+    in_csv: str,
+    out_xlsx: str,
+    delimiter: str = ",",
+    encoding: str = "utf-8",
+    header_present: bool = True,
+    drop_cols: Optional[str] = None,
+    split_col: Optional[str] = None,
+    split_every: Optional[int] = None,
+    sheet_name: str = "Sheet1",
+    autofit: bool = True,
+    csv_dialect: Optional[str] = None,
+) -> str:
+    check_deps()
+    out_xlsx = ensure_ext(out_xlsx, ".xlsx")
+
+    wb = _WB(write_only=False)
+    ws_map: Dict[str, _WS] = {}
+
+    with _io.open(in_csv, "r", newline="", encoding=encoding) as fh:
+        reader = _csv.reader(fh, dialect=csv_dialect) if csv_dialect else _csv.reader(fh, delimiter=delimiter)
+
+        header: Optional[List[str]] = None
+        first_row: Optional[List[str]] = None
+
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            DIE(EXIT_RUNTIME, "CSV is empty: %s", in_csv)
+
+        if header_present:
+            header = first_row
+        else:
+            # treat as data
+            reader = _csv.reader(_io.StringIO("\n".join([delimiter.join(first_row)] + [delimiter.join(r) for r in reader])), delimiter=delimiter)
+
+        drop_idx = _parse_drop_cols(drop_cols, header)
+
+        if split_col:
+            col_idx = _split_targets(header, split_col)
+        else:
+            col_idx = None
+
+        if split_every is not None and split_every <= 0:
+            DIE(EXIT_BAD_ARGS, "split-every must be > 0")
+
+        def get_ws(key: str) -> _WS:
+            if key not in ws_map:
+                ws = wb.create_sheet(title=sanitize_sheet_title(key)) if ws_map else wb.active
+                if not ws_map:
+                    ws.title = sanitize_sheet_title(key)
+                ws_map[key] = ws
+                if header is not None:
+                    ws.append(_drop_indices(header, drop_idx))
+            return ws_map[key]
+
+        if col_idx is not None:
+            # split by column value
+            ws = None
+            # first data row if header present, else handled by rebuild reader above
+            for row in (reader if header_present else reader):
+                if header_present and row is header:
+                    continue
+                key = str(row[col_idx]) if col_idx < len(row) else "NA"
+                ws = get_ws(key)
+                ws.append(_drop_indices(row, drop_idx))
+        elif split_every is not None:
+            # split by chunk size
+            part = 1
+            row_count = 0
+            ws = get_ws(f"{sheet_name}_part{part:02d}")
+            # emit first row(s)
+            if header_present and header is not None:
+                pass  # already emitted in get_ws
+            else:
+                # no header; nothing special
+                pass
+            # rebuild iterator with first_row if no header
+            itr: Iterable[List[str]]
+            if header_present:
+                itr = reader
+            else:
+                with _io.open(in_csv, "r", newline="", encoding=encoding) as fh2:
+                    itr = _csv.reader(fh2, delimiter=delimiter)
+            for row in itr:
+                if row_count >= split_every:
+                    part += 1
+                    row_count = 0
+                    ws = get_ws(f"{sheet_name}_part{part:02d}")
+                ws.append(_drop_indices(row, drop_idx))
+                row_count += 1
+        else:
+            # single sheet
+            ws = get_ws(sheet_name)
+            # emit data rows
+            itr2: Iterable[List[str]]
+            if header_present:
+                itr2 = reader
+            else:
+                with _io.open(in_csv, "r", newline="", encoding=encoding) as fh2:
+                    itr2 = _csv.reader(fh2, delimiter=delimiter)
+            for row in itr2:
+                ws.append(_drop_indices(row, drop_idx))
+
+    # auto-fit
+    if autofit:
+        for ws in wb.worksheets:
+            auto_fit_columns(ws)
+
+    wb.save(out_xlsx)
+    LOG_I("CSV->XLSX OK: %s (sha256=%s)", out_xlsx, sha256_file(out_xlsx))
+    return out_xlsx
+
+# ────────────────────────────────────────────
+# XLSX -> CSV
+# ────────────────────────────────────────────
+def xlsx_to_csv(
+    in_xlsx: str,
+    out_dir: str,
+    delimiter: str = ",",
+    encoding: str = "utf-8",
+    sheet: Optional[str] = None,
+    all_sheets: bool = False,
+    sanitize_csv: bool = True,
+) -> List[str]:
+    check_deps()
+    ensure_dir(out_dir)
+
+    wb = _ox.load_workbook(in_xlsx, data_only=True, read_only=True)
+    out_files: List[str] = []
+
+    def write_sheet(ws: "_WS") -> str:
+        name = sanitize_sheet_title(ws.title)
+        out_path = _os.path.join(out_dir, f"{name}.csv")
+        with _io.open(out_path, "w", newline="", encoding=encoding) as fh:
+            w = _csv.writer(fh, delimiter=delimiter)
+            for row in ws.iter_rows(values_only=True):
+                safe = [sanitize_csv_cell_for_formula_injection(x, sanitize_csv) for x in row]
+                w.writerow(["" if v is None else v for v in safe])
+        LOG_I("Wrote: %s (sha256=%s)", out_path, sha256_file(out_path))
+        return out_path
+
+    if all_sheets:
+        for ws in wb.worksheets:
+            out_files.append(write_sheet(ws))
+    else:
+        ws: _WS
+        if sheet is None:
+            ws = wb.active
+        else:
+            if sheet not in wb.sheetnames:
+                DIE(EXIT_BAD_ARGS, "Sheet not found: %s", sheet)
+            ws = wb[sheet]
+        out_files.append(write_sheet(ws))
+
+    return out_files
+
+# ────────────────────────────────────────────
+# CLI (C-flavored)
+# ────────────────────────────────────────────
+def _build_cli() -> "_arg.ArgumentParser":
+    p = _arg.ArgumentParser(
+        prog="excel_ops",
+        description="CSV<->XLSX Converter with auto-fit, column drop, sheet split (C-ish Python).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_csv2xlsx = sub.add_parser("csv2xlsx", help="Convert CSV to XLSX (with drop/split/autofit).")
+    p_csv2xlsx.add_argument("input", help="input CSV path")
+    p_csv2xlsx.add_argument("output", help="output XLSX path")
+    p_csv2xlsx.add_argument("--delimiter", default=",", help="CSV delimiter (default ,)")
+    p_csv2xlsx.add_argument("--encoding", default="utf-8", help="CSV encoding (default utf-8)")
+    p_csv2xlsx.add_argument("--no-header", action="store_true", help="CSV has no header row")
+    p_csv2xlsx.add_argument("--drop-cols", default=None, help="Columns to drop (comma separated names or 0-based indices)")
+    p_csv2xlsx.add_argument("--split-col", default=None, help="Split sheets by column (name or 0-based index)")
+    p_csv2xlsx.add_argument("--split-every", type=int, default=None, help="Split sheets every N rows")
+    p_csv2xlsx.add_argument("--sheet-name", default="Sheet1", help="Base sheet name (default Sheet1)")
+    p_csv2xlsx.add_argument("--no-autofit", action="store_true", help="Disable auto-fit column width")
+
+    p_xlsx2csv = sub.add_parser("xlsx2csv", help="Convert XLSX to CSV (optionally all sheets).")
+    p_xlsx2csv.add_argument("input", help="input XLSX path")
+    p_xlsx2csv.add_argument("outdir", help="output directory for CSV files")
+    p_xlsx2csv.add_argument("--delimiter", default=",", help="CSV delimiter (default ,)")
+    p_xlsx2csv.add_argument("--encoding", default="utf-8", help="CSV encoding (default utf-8)")
+    p_xlsx2csv.add_argument("--sheet", default=None, help="Sheet name (omit to use active)")
+    p_xlsx2csv.add_argument("--all-sheets", action="store_true", help="Export all sheets")
+    p_xlsx2csv.add_argument("--no-sanitize", action="store_true", help="Disable CSV formula-injection sanitation")
+
+    return p
+
+def main(argv: List[str]) -> int:
+    try:
+        args = _build_cli().parse_args(argv)
+
+        if args.cmd == "csv2xlsx":
+            if not _os.path.exists(args.input):
+                DIE(EXIT_BAD_ARGS, "input CSV not found: %s", args.input)
+            out = csv_to_xlsx(
+                in_csv=args.input,
+                out_xlsx=args.output,
+                delimiter=args.delimiter,
+                encoding=args.encoding,
+                header_present=(not args.no_header),
+                drop_cols=args.drop_cols,
+                split_col=args.split_col,
+                split_every=args.split_every,
+                sheet_name=args.sheet_name,
+                autofit=(not args.no_autofit),
+            )
+            LOG_I("DONE csv2xlsx -> %s", out)
+            return EXIT_OK
+
+        elif args.cmd == "xlsx2csv":
+            if not _os.path.exists(args.input):
+                DIE(EXIT_BAD_ARGS, "input XLSX not found: %s", args.input)
+            outs = xlsx_to_csv(
+                in_xlsx=args.input,
+                out_dir=args.outdir,
+                delimiter=args.delimiter,
+                encoding=args.encoding,
+                sheet=args.sheet,
+                all_sheets=args.all_sheets,
+                sanitize_csv=(not args.no_sanitize),
+            )
+            LOG_I("DONE xlsx2csv -> %d file(s)", len(outs))
+            return EXIT_OK
+
+        else:
+            DIE(EXIT_BAD_ARGS, "unknown command")
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        LOG_E("runtime failure: %s", str(e))
+        return EXIT_RUNTIME
+
+if __name__ == "__main__":
+    _sys.exit(main(_sys.argv[1:]))
